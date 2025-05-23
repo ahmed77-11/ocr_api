@@ -1,0 +1,234 @@
+import base64
+
+from flask import Flask, request, jsonify
+import fitz  # PyMuPDF
+from PIL import Image, ImageEnhance
+import io
+import os
+import re
+import difflib
+import numpy as np
+from google.cloud import vision
+from paddleocr import PaddleOCR
+from ultralytics import YOLO
+from pyzbar.pyzbar import decode
+
+app = Flask(__name__)
+
+# Initialize models
+signature_model = YOLO("./runs/medfactor/stamp-detection-ydrxo/exp/weights/best.pt")
+paddle_ocr_client = PaddleOCR(use_angle_cls=True, lang='fr')
+
+
+# Google Vision API client setup
+def setup_google_client(creds_path="C:/Users/mghir/Desktop/vision-458206-e466edc966f8.json"):
+    if not os.path.exists(creds_path):
+        raise FileNotFoundError("Google credentials file not found.")
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = creds_path
+    return vision.ImageAnnotatorClient()
+
+
+google_vision_client = setup_google_client()
+
+# Relative regions on PDF (normalized to 836x540 base)
+regions_rel = {
+    "traite_num": (650 / 836, 70 / 540, 800 / 836, 90 / 540),
+    "amount_digits": (623 / 836, 120 / 540, 821 / 836, 155 / 540),
+    "date_due": (270 / 836, 270 / 540, 402 / 836, 313 / 540),
+    "date_created": (145 / 836, 270 / 540, 270 / 836, 310 / 540),
+    "date_due1": (230 / 836, 70 / 540, 385 / 836, 105 / 540),
+    "date_created1": (402 / 836, 80 / 540, 550 / 836, 95 / 540),
+    "place_created": (11 / 836, 275 / 540, 146 / 836, 310 / 540),
+    "place_created1": (402 / 836, 50 / 540, 540 / 836, 70 / 540),
+    "rib": (231 / 836, 110 / 540, 600 / 836, 161 / 540),
+    "drawer_name": (13 / 836, 169 / 540, 210 / 836, 203 / 540),
+    "amount_words": (20 / 836, 222 / 540, 790 / 836, 260 / 540),
+    "company_name": (226 / 836, 200 / 540, 610 / 836, 225 / 540),
+    "payer_name_address": (362 / 836, 352 / 540, 548 / 836, 450 / 540),
+    "bank": (555 / 836, 320 / 540, 820 / 836, 380 / 540),
+    "signature_tireur": (560 / 836, 385 / 540, 815 / 836, 445 / 540),
+}
+MARGIN = 20
+
+
+# -------- Utility Functions -------- #
+
+def extract_first_page_image(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(0)
+    pix = page.get_pixmap()
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+
+def enhance_image(img):
+    img = ImageEnhance.Sharpness(img).enhance(2.5)
+    img = ImageEnhance.Contrast(img).enhance(3.0)
+    #img = ImageEnhance.Brightness(img).enhance(1.1)
+    return img
+
+
+def crop_regions(img):
+    w, h = img.size
+    regions = {}
+    for key, (x0r, y0r, x1r, y1r) in regions_rel.items():
+        x0 = max(0, int(x0r * w) - MARGIN)
+        y0 = max(0, int(y0r * h) - MARGIN)
+        x1 = min(w, int(x1r * w) + MARGIN)
+        y1 = min(h, int(y1r * h) + MARGIN)
+        regions[key] = img.crop((x0, y0, x1, y1))
+    return regions
+
+
+def clean_text(text, field):
+    text = text.strip()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\x20-\x7E]+', '', text)
+
+    if field == "amount_digits":
+        text = re.sub(r'[^\d.,]', '', text)
+    elif field in ["place_created", "place_created1"]:
+        text = re.sub(r'\b[aA]\b', '', text)
+    elif field == "company_name":
+        text = re.sub(r'\b(Oui|Non)\b', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b(y1gas|py1gas)\b', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'[^a-zA-Z0-9\s\-\&]', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+    elif field in ["date_due", "date_created", "date_due1", "date_created1"]:
+        date_patterns = [
+            r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',
+            r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b',
+            r'\b\d{1,2}\s+[A-Za-zéèêîû]+\s+\d{4}\b',
+            r'\b[A-Za-zéèêîû]+\s+\d{1,2},\s*\d{4}\b',
+            r'\b\d{1,2}[-/][A-Za-z]{3,}[-/]\d{2,4}\b',
+        ]
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                text = match.group(0)
+                break
+    elif field == "traite_num":
+        text = re.sub(r'\D', '', text)
+    elif field == "bank":
+        text = re.sub(r'\b(Domiciliation)\b', '', text, flags=re.IGNORECASE)
+    elif field == "amount_words":
+        valid_words = {
+            'zéro', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf',
+            'dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize', 'vingt', 'trente',
+            'quarante', 'cinquante', 'soixante', 'soixante-dix', 'quatre-vingt', 'quatre-vingts',
+            'quatre-vingt-dix', 'cent', 'cents', 'mille', 'million', 'millions', 'milliard', 'milliards',
+            'et', 'dinars', 'dinar'
+        }
+        text = text.lower()
+        text = re.sub(r'\d+', '', text)
+        text = re.sub(r'[^a-zàâçéèêëîïôûùüÿñæœ\s-]', '', text)
+        words = text.split()
+        filtered = [difflib.get_close_matches(w, valid_words, n=1, cutoff=0.8)[0]
+                    for w in words if difflib.get_close_matches(w, valid_words, n=1, cutoff=0.8)]
+        text = ' '.join(filtered)
+    elif field == "rib":
+        text = re.sub(r'[^\d]', '', text)
+
+    return text
+
+
+def ocr_paddle(region_img):
+    result = paddle_ocr_client.ocr(np.array(region_img), cls=True)
+    texts = [line[1][0] for line in result[0]] if result and result[0] else []
+    return ' '.join(texts)
+
+
+def ocr_google(region_img):
+    buffer = io.BytesIO()
+    region_img.save(buffer, format="PNG")
+    content = buffer.getvalue()
+    image = vision.Image(content=content)
+    response = google_vision_client.text_detection(image=image)
+    return response.text_annotations[0].description if response.text_annotations else ""
+
+
+def detect_barcode(img):
+    decoded = decode(img)
+    data =""
+    for barcode in decoded:
+        data = barcode.data.decode("utf-8")
+        print(data)
+
+    return data
+
+
+def detect_signature(img):
+    img_np = np.array(img)
+    results = signature_model(img_np)
+    count = 0
+    for r in results:
+        for box in r.boxes:
+            if box.conf[0] >= 0.5:
+                count += 1
+    return count
+
+
+def process_pdf_with_ocr(pdf_bytes, ocr_func):
+    img = extract_first_page_image(pdf_bytes)
+    img = enhance_image(img)
+    regions = crop_regions(img)
+
+    extracted_data = {}
+    for field, region_img in regions.items():
+        text = ocr_func(region_img)
+        cleaned = clean_text(text, field)
+        extracted_data[field] = cleaned
+
+    # Detect barcode
+    barcode = detect_barcode(img)
+    extracted_data["barcode"] = barcode
+
+    # Detect signature/stamp
+    num_signatures = detect_signature(img)
+    extracted_data["signature_count"] = num_signatures
+
+    # Check if barcode matches traite_num
+    traite_num = extracted_data.get("traite_num", "")
+    is_barcode_match = (barcode == traite_num)
+
+    # Check if at least one signature/stamp is detected
+    is_signature_detected = num_signatures > 0
+
+    # Add validation results
+    extracted_data["validation"] = {
+        "barcode": barcode,
+        "barcode_matches_traite_num": is_barcode_match,
+        "signature_detected": is_signature_detected
+    }
+
+    return extracted_data
+
+
+
+# -------- Routes -------- #
+
+@app.route('/paddleocr', methods=['POST'])
+def paddleocr_endpoint():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({"error": "Missing file"}), 400
+    try:
+        data = process_pdf_with_ocr(file.read(), ocr_paddle)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/googlevision', methods=['POST'])
+def googlevision_endpoint():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({"error": "Missing file"}), 400
+    try:
+        data = process_pdf_with_ocr(file.read(), ocr_google)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=8000)
