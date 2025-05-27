@@ -14,7 +14,6 @@ import difflib
 import cv2
 from pyzbar.pyzbar import decode
 import tempfile
-import datetime
 import base64
 from io import BytesIO
 
@@ -32,12 +31,6 @@ REFERENCE_WIDTH = 836
 REFERENCE_HEIGHT = 540
 MARGIN = 20
 
-month_map = {
-    'janvier': 1, 'février': 2, 'mars': 3, 'avril': 4, 'mai': 5, 'juin': 6,
-    'juillet': 7, 'août': 8, 'septembre': 9, 'octobre': 10, 'novembre': 11, 'décembre': 12,
-    'jan': 1, 'fév': 2, 'mar': 3, 'avr': 4, 'mai': 5, 'jun': 6, 'jul': 7,
-    'aoû': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'déc': 12
-}
 # Define relative regions
 regions_rel = {
     "traite_num": (650 / 836, 70 / 540, 800 / 836, 90 / 540),
@@ -51,8 +44,7 @@ regions_rel = {
     "rib": (231 / 836, 110 / 540, 600 / 836, 161 / 540),
     "drawer_name": (13 / 836, 169 / 540, 210 / 836, 203 / 540),
     "amount_words": (20 / 836, 222 / 540, 790 / 836, 260 / 540),
-    # "company_name": (226 / 836, 200 / 540, 610 / 836, 225 / 540),
-    "company_name": (220 / 836, 192 / 540, 620 / 836, 226 / 540),
+    "company_name": (226 / 836, 200 / 540, 610 / 836, 225 / 540),
     "payer_name_address": (362 / 836, 352 / 540, 548 / 836, 450 / 540),
     "bank": (555 / 836, 320 / 540, 820 / 836, 380 / 540),
     "signature_tireur": (560 / 836, 385 / 540, 815 / 836, 445 / 540),
@@ -109,7 +101,7 @@ def process_pdf_to_image(pdf_file):
     img_w, img_h = image.size
     image = image.convert("L")
     image = ImageEnhance.Contrast(image).enhance(2.5)
-    image = ImageEnhance.Sharpness(image).enhance(2.5)
+    image = ImageEnhance.Sharpness(image).enhance(3.0)
     image = image.convert("RGB")
 
     return image, img_w, img_h
@@ -135,43 +127,6 @@ def point_in_rect(pt, rect):
     x, y = pt
     x0, y0, x1, y1 = rect
     return x0 <= x <= x1 and y0 <= y <= y1
-def validate_date_order(date_str):
-    """Validate logical date component order and values"""
-    try:
-        parts = re.split(r'[-/\.]', date_str)
-        if len(parts) != 3:
-            return False
-
-        # Handle textual months
-        if parts[1].lower() in month_map:
-            day = int(parts[0])
-            month = month_map[parts[1].lower()]
-            year = int(parts[2])
-            if year < 100:  # Handle 2-digit year
-                year += 2000 if year < 25 else 1900
-        else:
-            # Try different format permutations
-            for fmt in ['%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d']:
-                try:
-                    parsed = datetime.strptime(date_str, fmt)
-                    day, month, year = parsed.day, parsed.month, parsed.year
-                    break
-                except ValueError:
-                    continue
-            else:
-                return False
-
-        # Validate component ranges
-        if not (1 <= day <= 31):
-            return False
-        if not (1 <= month <= 12):
-            return False
-        if year < 1900 or year > 2100:
-            return False
-
-        return True
-    except Exception:
-        return False
 
 
 def clean_text(text, field):
@@ -179,7 +134,6 @@ def clean_text(text, field):
     text = text.strip()
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'[^\x20-\x7E]+', '', text)
-    rem="Contre cette lettre de change Protestable paver lordre"
 
     if field == "amount_digits":
         text = re.sub(r'[^\d.,]', '', text)
@@ -187,18 +141,16 @@ def clean_text(text, field):
         text = re.sub(r'\b[aA]\b', '', text)
     elif field == "company_name":
         text = re.sub(r'\b(Oui|Non)\b', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\b(y1gas|py1gas|Contre cette lettre de change Protestable payer lordre)\b', '', text, flags=re.IGNORECASE)
-
+        text = re.sub(r'\b(y1gas|py1gas)\b', '', text, flags=re.IGNORECASE)
         text = re.sub(r'[^a-zA-Z0-9\s\-\&]', '', text)
         text = re.sub(r'\s+', ' ', text).strip()
     elif field in ["date_due", "date_created", "date_due1", "date_created1"]:
-        text = re.sub(r'^\s*(Le|A)\s*', '', text, flags=re.IGNORECASE)
-        # Updated patterns with flexible spacing around separators
         patterns = [
-            r'\b\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4}\b',
-            r'\b\d{4}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{1,2}\b',
+            r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',
+            r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b',
             r'\b\d{1,2}\s+[A-Za-zéèêîû]+\s+\d{4}\b',
-            r'\b\d{1,2}\s*[-/]\s*[A-Za-z]{3,}\s*[-/]\s*\d{2,4}\b',
+            r'\b[A-Za-zéèêîû]+\s+\d{1,2},\s*\d{4}\b',
+            r'\b\d{1,2}[-/][A-Za-z]{3,}[-/]\d{2,4}\b',
         ]
         for pattern in patterns:
             match = re.search(pattern, text)
@@ -230,29 +182,21 @@ def clean_text(text, field):
     return text
 
 
-
 def better_date(d1, d2):
-    """Enhanced date selection with validation prioritization"""
-
-    def date_quality(date):
-        if not date:
-            return (0, 0)  # (validity, completeness)
-
-        valid = 1 if validate_date_order(date) else 0
-        components = len(re.split(r'[-/\.]', date))
-        year_length = len(re.search(r'\d{4}', date).group()) if re.search(r'\d{4}', date) else 0
-        return (valid, components + year_length)
-
-    q1 = date_quality(d1)
-    q2 = date_quality(d2)
-
-    if q1 > q2:
-        return d1
-    elif q2 > q1:
+    """Choose better date between two candidates"""
+    if not d1 and d2:
         return d2
-
-    # Fallback to string length
-    return d1 if len(d1) >= len(d2) else d2
+    if d1 and not d2:
+        return d1
+    if not d1 and not d2:
+        return ""
+    score1 = len(re.findall(r'[^a-zA-Z0-9]', d1))
+    score2 = len(re.findall(r'[^a-zA-Z0-9]', d2))
+    if score1 < score2:
+        return d1
+    elif score2 < score1:
+        return d2
+    return d1 if len(d1) <= len(d2) else d2
 
 
 def looks_like_place(text):

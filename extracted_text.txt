@@ -1,0 +1,183 @@
+# %%
+# End-to-End Fraud Detection Notebook (Advanced)
+# This notebook assumes you already have a populated 'drafts' table in your database.
+# It focuses on:
+# - Data loading from DB
+# - Advanced feature engineering
+# - Model training with hyperparameter tuning
+# - Evaluation metrics and visualizations
+# - Explainability with SHAP
+# - Model serialization and inference
+
+# %%
+# Imports
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sqlalchemy import create_engine
+import joblib
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import roc_auc_score, precision_recall_curve, RocCurveDisplay, PrecisionRecallDisplay
+import shap
+
+# Set database connection (replace with your URI)
+DB_URI = os.getenv('DB_URI', 'sqlite:///drafts.db')
+engine = create_engine(DB_URI)
+
+# %%
+# 1. Data Loading & Initial Check
+
+df = pd.read_sql('SELECT * FROM drafts', engine)
+print(f"Loaded {len(df)} records")
+df.head()
+
+# %%
+# 2. Data Cleaning & Basic Preprocessing
+
+def clean_data(df):
+    df = df.copy()
+    # Dates
+    df['date_created'] = pd.to_datetime(df['date_created'], errors='coerce')
+    df['date_due'] = pd.to_datetime(df['date_due'], errors='coerce')
+    # Numeric
+    df['amount_digits'] = pd.to_numeric(df['amount_digits'], errors='coerce')
+    # Booleans
+    df['signature_detected'] = df['signature_detected'].astype(bool)
+    df['barcode_validates_traite'] = df['barcode_validates_traite'].astype(bool)
+    # Strings strip
+    for col in ['bank','place_created','drawer_name','payer_name_address','amount_words']:
+        df[col] = df[col].astype(str).str.strip()
+    return df.dropna(subset=['amount_digits','date_created','date_due','rib'])
+
+df = clean_data(df)
+print(df.info())
+
+# %%
+# 3. Exploratory Data Analysis
+
+# 3.1 Amount distribution by fraud label
+g = sns.histplot(data=df, x='amount_digits', hue='fraud_label', bins=50, alpha=0.6)
+g.set(title='Amount Distribution: Legit vs Fraud', xlabel='Amount (dinars)')
+plt.show()
+
+# 3.2 Correlation heatmap of numeric features
+umeric_feats = df[['amount_digits','signature_detected','barcode_validates_traite','fraud_label']]
+corr = numeric_feats.corr()
+sns.heatmap(corr, annot=True, cmap='coolwarm')
+plt.title('Numeric Feature Correlations')
+plt.show()
+
+# %%
+# 4. Advanced Feature Engineering
+
+def amount_to_words_fr(x):
+    from num2words import num2words
+    text = num2words(x, lang='fr')
+    return text.replace('virgule', 'dinars zéro')
+
+def is_valid_rib(v):
+    s = v.replace(' ','').replace('-','')
+    if len(s)!=20: return False
+    n = int(s[:-2]+'00'); chk = 97 - (n%97)
+    return chk == int(s[-2:])
+
+# Create features
+df['hour'] = df['date_created'].dt.hour
+df['gap_days'] = (df['date_due'] - df['date_created']).dt.days
+df['amount_words_mismatch'] = (df['amount_words'] != df['amount_digits'].apply(amount_to_words_fr)).astype(int)
+df['rib_invalid'] = (~df['rib'].apply(is_valid_rib)).astype(int)
+# Text length features
+df['drawer_len'] = df['drawer_name'].str.len()
+df['payer_len'] = df['payer_name_address'].str.len()
+
+# One-hot encode bank for top 10 only
+ top_banks = df['bank'].value_counts().nlargest(10).index
+df['bank_top'] = df['bank'].where(df['bank'].isin(top_banks), 'OTHER')
+df = pd.get_dummies(df, columns=['bank_top'], drop_first=True)
+
+# Feature matrix and target
+target = 'fraud_label'
+features = ['amount_digits','hour','gap_days','amount_words_mismatch','rib_invalid',
+            'signature_detected','barcode_validates_traite','drawer_len','payer_len'] 
+features += [col for col in df.columns if col.startswith('bank_top_')]
+X = df[features]
+y = df[target]
+
+# %%
+# 5. Train-Test Split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+print(f"Train positive rate: {y_train.mean():.3f}, Test positive rate: {y_test.mean():.3f}")
+
+# %%
+# 6. Model Training with Hyperparameter Tuning (XGBoost)
+from xgboost import XGBClassifier
+params = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5],
+    'learning_rate': [0.01, 0.1]
+}
+clf = XGBClassifier(use_label_encoder=False, eval_metric='logloss', scale_pos_weight=(len(y_train)-y_train.sum())/y_train.sum())
+grid = GridSearchCV(clf, params, scoring='roc_auc', cv=3, n_jobs=-1)
+grid.fit(X_train, y_train)
+print("Best parameters:", grid.best_params_)
+model = grid.best_estimator_
+
+# %%
+# 7. Evaluation
+# 7.1 ROC Curve
+RocCurveDisplay.from_estimator(model, X_test, y_test)
+plt.show()
+
+# 7.2 Precision-Recall Curve
+PrecisionRecallDisplay.from_estimator(model, X_test, y_test)
+plt.show()
+
+# 7.3 AUC Score
+auc = roc_auc_score(y_test, model.predict_proba(X_test)[:,1])
+print(f"Test ROC AUC: {auc:.3f}")
+
+# %%
+# 8. Explainability with SHAP
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+shap.summary_plot(shap_values, X_test, plot_type='bar')
+
+# %%
+# 9. Model Persistence
+model_dir = 'models'
+os.makedirs(model_dir, exist_ok=True)
+model.save_model(os.path.join(model_dir, 'xgb_model.json'))
+joblib.dump(features, os.path.join(model_dir, 'features.pkl'))
+print(f"Model and feature list saved to {model_dir}")
+
+# %%
+# 10. Inference Function Example
+
+def predict_transaction(input_dict):
+    feat_list = joblib.load(os.path.join(model_dir, 'features.pkl'))
+    model = XGBClassifier()
+    model.load_model(os.path.join(model_dir, 'xgb_model.json'))
+    input_df = pd.DataFrame([input_dict])[feat_list]
+    prob = model.predict_proba(input_df)[:,1][0]
+    return {'fraud_score': prob, 'fraud_label': int(prob>0.5)}
+
+# %%
+# Analysis of Strengths and Weaknesses
+# **What's Good:**
+# - Advanced feature engineering capturing time, text mismatch, RIB validity
+# - Hyperparameter tuning and robust validation
+# - Comprehensive evaluation (ROC, PR curves)
+# - Explainability via SHAP
+# - Modular save/load for deployment
+# **What's Wrong/Needs Improvement:**
+# - Text features (address, drawer) are only length-based; consider NLP embeddings
+# - No anomaly detection module for amount outliers; could add an autoencoder
+# - Imbalanced data handling relies on scale_pos_weight; try SMOTE or other techniques
+# - No monitoring or drift detection in production
+# - Database I/O not optimized for large scale; consider batch processing or feature store

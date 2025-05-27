@@ -18,7 +18,7 @@ def setup_environment():
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = creds_path
 
 # === 2. Load PDF, convert first page to image ===
-pdf_path = 'C:/Users/mghir/downloads/TR1.pdf'
+pdf_path = 'C:/Users/mghir/downloads/TR4.pdf'
 doc = fitz.open(pdf_path)
 page = doc[0]
 pix = page.get_pixmap(dpi=300)
@@ -184,14 +184,14 @@ for k in cleaned:
 # === 11. YOLO signature detection ===
 signature_model = YOLO("./runs/medfactor/stamp-detection-ydrxo/exp/weights/best.pt")  # Adjust path accordingly
 img_for_yolo = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-results = signature_model(img_for_yolo)[0]
+results = signature_model(img_for_yolo)
 
 print(results[0].show())
 
 signature_detected = False
 signature_box = None
-for box in results.boxes:
-    if box.cls == 0:  # assuming class 0 is signature
+for r in results:
+    for box in r.boxes:
         signature_detected = True
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         signature_box = (x1, y1, x2, y2)
