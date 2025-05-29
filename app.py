@@ -1,3 +1,4 @@
+import shap
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -6,6 +7,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from google.cloud import vision
 from google.api_core.exceptions import GoogleAPICallError
+from num2words import num2words
 from paddleocr import PaddleOCR
 from ultralytics import YOLO
 import numpy as np
@@ -15,6 +17,9 @@ import cv2
 from pyzbar.pyzbar import decode
 import tempfile
 import datetime
+import pandas as pd
+import joblib
+from sqlalchemy import create_engine
 import base64
 from io import BytesIO
 
@@ -26,6 +31,227 @@ CORS(app,
          "allow_headers": ["Content-Type", "Authorization"]
 }})
 
+MODEL_PATH = './xgb_model56.pkl'
+DB_URI = 'sqlite:///drafts1.db'
+THRESHOLD = 0.667
+# --- Load model ---
+model = joblib.load(MODEL_PATH)
+
+# --- Load per‑RIB & global stats once at startup ---
+engine = create_engine(DB_URI)
+df = pd.read_sql_table('drafts', engine)
+
+
+
+rib_stats = (
+    df
+    .groupby('rib')['amount_digits']
+    .agg(mean_amt='mean', std_amt='std', count='count')
+)
+pop_mean = df['amount_digits'].mean()
+pop_std  = df['amount_digits'].std()
+
+# Load the trained model
+_xgb = joblib.load(MODEL_PATH)
+
+
+def amount_to_words_fr(x): return num2words(x, lang='fr').replace('virgule','dinars zéro')
+
+def is_valid_rib(v):
+    s = ''.join(filter(str.isdigit, str(v)))
+    if len(s) != 20: return False
+    try:
+        n = int(s[:-2] + '00'); chk = 97 - (n % 97)
+        return chk == int(s[-2:])
+    except: return False
+
+
+def build_features(raw: dict) -> list:
+    """Reproduce your notebook’s preprocessing pipeline."""
+    # 1) Date gap
+    d0 = pd.to_datetime(raw['date_created'])
+    d1 = pd.to_datetime(raw['date_due'])
+    gap = (d1 - d0).days
+
+    # 2) Core flags & lengths
+    amt = float(raw['amount_digits'])
+    spell_ok = int(raw['amount_words'].strip().lower() == amount_to_words_fr(amt))
+    sig_missing = int(not raw['signature_detected'])
+    bc_bad = int(not raw['barcode_validates_traite'])
+    print(is_valid_rib(raw['rib']))
+    rib_bad = int(not is_valid_rib(raw['rib']))
+    payer_len = len(raw['payer_name_address'])
+    drawer_len = len(raw['drawer_name'])
+
+    # 3) z‑score for this RIB
+    r = raw['rib']
+    if r in rib_stats.index and rib_stats.at[r, 'count'] >= 5:
+        mu, sigma = rib_stats.at[r, 'mean_amt'], rib_stats.at[r, 'std_amt']
+    else:
+        mu, sigma = pop_mean, pop_std
+
+    z = (amt - mu) / sigma if sigma and sigma > 0 else 0.0
+    outlier_z = int(abs(z) > 3)
+
+    return [amt, gap, spell_ok, sig_missing, bc_bad, rib_bad,
+            payer_len, drawer_len, z, outlier_z]
+
+
+explainer = shap.TreeExplainer(model)
+
+# Feature names matching your model
+features = ['amount_digits', 'gap_days', 'words_match', 'sig_missing', 'barcode_bad', 'rib_invalid', 'payer_len',
+            'drawer_len', 'rib_amount_z', 'amount_incompatible']
+
+
+def explain_prediction_api(raw_input, threshold=THRESHOLD):
+    """
+    Generate human-readable explanation for fraud prediction
+    Returns structured explanation data for API response
+    """
+    try:
+        # Build features using existing function
+        feat = build_features(raw_input)
+
+        # Get prediction probability
+        prob = model.predict_proba([feat])[0][1]
+
+        # Get SHAP values
+        shap_vals = explainer.shap_values([feat])[0]
+
+        # Generate explanations
+        reasons_for_fraud = []
+        reasons_against_fraud = []
+
+        for name, val, sv in zip(features, feat, shap_vals):
+            if sv > 0.01:  # Positive contribution to fraud
+                if name == "sig_missing" and val == 1:
+                    reasons_for_fraud.append({
+                        "feature": "signature",
+                        "message": "La signature n'est pas présente, ce qui indique souvent une fraude",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "words_match" and val == 0:
+                    reasons_for_fraud.append({
+                        "feature": "amount_match",
+                        "message": "Le montant en lettres ne correspond pas au montant en chiffres",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "rib_invalid" and val == 1:
+                    reasons_for_fraud.append({
+                        "feature": "rib_validation",
+                        "message": "Le format RIB semble invalide",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "barcode_bad" and val == 1:
+                    reasons_for_fraud.append({
+                        "feature": "barcode_validation",
+                        "message": "Le code-barres n'est pas validé par rapport au numéro de traite",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "rib_amount_z" and abs(val) > 2:
+                    reasons_for_fraud.append({
+                        "feature": "amount_anomaly",
+                        "message": f"Le montant s'écarte considérablement des normes historiques du RIB", #"(z-score: {val:.2f})"",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "amount_incompatible" and val == 1:
+                    reasons_for_fraud.append({
+                        "feature": "amount_compatibility",
+                        "message": "RIB et montant sont statistiquement incompatibles",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "gap_days" and val > 365:
+                    reasons_for_fraud.append({
+                        "feature": "date_gap",
+                        "message": f"Écart inhabituellement long entre la date de création et la date d'échéance ({int(val)} jours)",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "payer_len" and val < 10:
+                    reasons_for_fraud.append({
+                        "feature": "payer_name",
+                        "message": "Le nom/l'adresse du tire semble incomplet ou trop court",
+                        "impact": round(float(sv), 3)
+                    })
+                elif name == "drawer_len" and val < 10:
+                    reasons_for_fraud.append({
+                        "feature": "drawer_name",
+                        "message": "Le nom du tireur semble incomplet ou trop court",
+                        "impact": round(float(sv), 3)
+                    })
+
+            elif sv < -0.01:  # Negative contribution (against fraud)
+                if name == "sig_missing" and val == 0:
+                    reasons_against_fraud.append({
+                        "feature": "signature",
+                        "message": "La signature est présente, ce qui est courant dans les brouillons valides",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+                elif name == "words_match" and val == 1:
+                    reasons_against_fraud.append({
+                        "feature": "amount_match",
+                        "message": "Les montants écrits et numériques correspondent parfaitement",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+                elif name == "rib_invalid" and val == 0:
+                    reasons_against_fraud.append({
+                        "feature": "rib_validation",
+                        "message": "Le format RIB est valide",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+                elif name == "barcode_bad" and val == 0:
+                    reasons_against_fraud.append({
+                        "feature": "barcode_validation",
+                        "message": "Code-barres validé correctement par rapport au numéro de trait",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+                elif name == "amount_digits" and 100 <= val <= 50000:
+                    reasons_against_fraud.append({
+                        "feature": "amount_range",
+                        "message": "Le montant de la transaction se situe dans la fourchette normale",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+                elif name == "gap_days" and 0 <= val <= 180:
+                    reasons_against_fraud.append({
+                        "feature": "date_gap",
+                        "message": f"L'écart entre les dates d'échéance est raisonnable ({int(val)} jours)",
+                        "impact": round(float(abs(sv)), 3)
+                    })
+
+        # Generate summary
+        if prob > threshold:
+            summary = "Probablement frauduleux en raison de plusieurs signaux d'alarme détectés"
+            risk_level = "HIGH"
+        elif prob > threshold * 0.7:
+            summary = "Risque de fraude modéré - nécessite un examen manuel"
+            risk_level = "MEDIUM"
+        else:
+            summary = "Probablement légitime sur la base des indicateurs actuels"
+            risk_level = "LOW"
+
+        return {
+            "probability": round(float(prob), 3),
+            "predicted_label": bool(prob > threshold),
+            "risk_level": risk_level,
+            "summary": summary,
+            "reasons_for_fraud": reasons_for_fraud,
+            "reasons_against_fraud": reasons_against_fraud,
+            "feature_values": {
+                name: round(float(val), 3) if isinstance(val, (int, float)) else val
+                for name, val in zip(features, feat)
+            },
+            "shap_values": {
+                name: round(float(sv), 3)
+                for name, sv in zip(features, shap_vals)
+            }
+        }
+
+    except Exception as e:
+        return {
+            "error": f"Explanation generation failed: {str(e)}",
+            "probability": None,
+            "predicted_label": None
+        }
 
 # === Global Configuration ===
 REFERENCE_WIDTH = 836
@@ -467,6 +693,91 @@ def ocr_paddle():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/predict/fraud', methods=['POST'])
+def predict_fraud():
+    """
+    Enhanced fraud prediction with detailed explanations
+    Expects JSON with:
+      - amount_digits (str or float)
+      - date_created  (YYYY-MM-DD)
+      - date_due      (YYYY-MM-DD)
+      - amount_words  (str)
+      - signature_detected       (bool)
+      - barcode_validates_traite (bool)
+      - rib           (str)
+      - payer_name_address (str)
+      - drawer_name   (str)
+    """
+    data = request.get_json(force=True)
+
+    # Check if explanation is requested (default: True)
+    include_explanation = data.get('include_explanation', True)
+
+    try:
+        if include_explanation:
+            # Get detailed explanation
+            explanation = explain_prediction_api(data)
+            print(explanation)
+            return jsonify({
+                'success': True,
+                'prediction': {
+                    'fraud_score': explanation['probability'],
+                    'fraud_label': explanation['predicted_label'],
+                    'risk_level': explanation['risk_level'],
+                    'summary': explanation['summary'],
+                    'detailed_analysis': {
+                        'reasons_for_fraud': explanation['reasons_for_fraud'],
+                        'reasons_against_fraud': explanation['reasons_against_fraud']
+                    },
+                    'technical_details': {
+                        'feature_values': explanation['feature_values'],
+                        'shap_contributions': explanation['shap_values']
+                    }
+                }
+            })
+        else:
+            # Simple prediction without explanation (faster)
+            feats = build_features(data)
+            raw_model_prob = model.predict_proba([feats])[0][1]
+            prob_python = float(raw_model_prob)
+            score = round(prob_python, 3)
+            label = bool(prob_python > THRESHOLD)
+
+            return jsonify({
+                'success': True,
+                'prediction': {
+                    'fraud_score': score,
+                    'fraud_label': label
+                }
+            })
+
+    except Exception as e:
+        print(e)
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+
+@app.route('/api/explain/fraud', methods=['POST'])
+def explain_fraud():
+    """
+    Dedicated endpoint for fraud explanation
+    Same input format as prediction endpoint
+    """
+    data = request.get_json(force=True)
+
+    try:
+        explanation = explain_prediction_api(data)
+
+        if 'error' in explanation:
+            return jsonify({'success': False, 'error': explanation['error']}), 400
+
+        return jsonify({
+            'success': True,
+            'explanation': explanation
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
 # === Health Check Endpoint ===
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -476,6 +787,7 @@ def health_check():
         'available_endpoints': [
             '/api/ocr/google - POST - OCR using Google Vision API',
             '/api/ocr/paddle - POST - OCR using PaddleOCR',
+            '/api/predict/fraud -POST- Predict Fraud',
             '/api/health - GET - Health check'
         ]
     })
